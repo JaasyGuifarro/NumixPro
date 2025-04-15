@@ -18,8 +18,8 @@
       ]
     }
   ],
-  "outputDirectory": "NumixPro-main/.next",
-  "buildCommand": "cd NumixPro-main && npm install --legacy-peer-deps && npm run build",
-  "installCommand": "cd NumixPro-main && npm install --legacy-peer-deps",
+  "outputDirectory": "NumixPro-main/NumixPro-main/.next",
+  "buildCommand": "cd NumixPro-main/NumixPro-main && npm install --legacy-peer-deps && npm run build",
+  "installCommand": "npm install --legacy-peer-deps",
   "framework": "nextjs"
 }

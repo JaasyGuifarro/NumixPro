@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "cd NumixPro-main && npm run dev",
-    "build": "cd NumixPro-main && npm run build",
-    "start": "cd NumixPro-main && npm run start",
-    "lint": "cd NumixPro-main && npm run lint"
+    "dev": "cd NumixPro-main/NumixPro-main && npm run dev",
+    "build": "cd NumixPro-main/NumixPro-main && npm run build",
+    "start": "cd NumixPro-main/NumixPro-main && npm run start",
+    "lint": "cd NumixPro-main/NumixPro-main && npm run lint"
   },
   "dependencies": {
     "next": "15.1.0",
