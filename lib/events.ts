@@ -307,31 +307,30 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
   }
 
   try {
+    // Importar utilidades de fallback para manejar errores de RPC
+    const { executeRPCWithFallback } = await import('./rpc-fallback-utils');
+    
     // Crear un canal con un ID único para evitar conflictos
     const channelId = `events-changes-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
-
-    console.log(`Creando canal de suscripción: ${channelId}`)
 
     // Verificar si ya existe una suscripción activa y eliminarla
     const existingChannels = supabase.getChannels()
     existingChannels.forEach(channel => {
       if (channel.topic.startsWith('realtime:events-changes-')) {
-        console.log(`Eliminando canal existente: ${channel.topic}`)
         try {
           supabase.removeChannel(channel)
         } catch (removeError) {
-          console.error(`Error al eliminar canal existente: ${removeError}`)
           // Continuar con la operación incluso si hay error al eliminar
         }
       }
     })
     
     // Esperar un momento después de eliminar canales para evitar conflictos
-    await new Promise(resolve => setTimeout(resolve, 500))
+    await new Promise(resolve => setTimeout(resolve, 300))
 
     // Contador de reconexiones para implementar backoff exponencial
     let reconnectAttempts = 0;
-    const maxReconnectAttempts = 15; // Máximo número de intentos antes de rendirse
+    const maxReconnectAttempts = 20; // Aumentar el máximo de intentos
     
     // Crear un nuevo canal con configuración mejorada
     const channel = supabase.channel(channelId, {
@@ -339,9 +338,9 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
         broadcast: { self: true },
         presence: { key: "" },
         // Aumentar el tiempo de espera para evitar cierres prematuros
-        timeout: 300000, // 300 segundos (5 minutos)
-        retryIntervalMs: 5000, // 5 segundos entre reintentos (más rápido)
-        retryMaxCount: 10 // Aumentar a 10 reintentos para mayor persistencia
+        timeout: 600000, // 600 segundos (10 minutos)
+        retryIntervalMs: 3000, // 3 segundos entre reintentos (más rápido)
+        retryMaxCount: 15 // Aumentar a 15 reintentos para mayor persistencia
       },
     })
 
@@ -349,6 +348,8 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
     let isChannelActive = true;
     // Variable para rastrear si estamos procesando un evento
     let isProcessingEvent = false;
+    // Variable para almacenar el último estado de error
+    let lastErrorMessage = "";
 
     // Configurar la suscripción con manejo de errores mejorado
     channel
@@ -365,14 +366,13 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
           
           // Implementar un sistema de cola simple para eventos concurrentes
           if (isProcessingEvent) {
-            console.log("Ya se está procesando un evento, encolando...");
             // Esperar a que termine el procesamiento actual antes de continuar
             let waitCount = 0;
-            const maxWaits = 10; // Máximo número de intentos de espera
+            const maxWaits = 15; // Aumentar el máximo de intentos de espera
             
             while (isProcessingEvent && waitCount < maxWaits) {
               // Esperar antes de verificar nuevamente
-              await new Promise(resolve => setTimeout(resolve, 300));
+              await new Promise(resolve => setTimeout(resolve, 200));
               waitCount++;
               
               // Verificar si el canal sigue activo después de cada espera
@@ -380,18 +380,20 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
             }
             
             // Si después de esperar sigue procesando, salir para evitar bloqueo
-            if (isProcessingEvent) {
-              console.log("Evento descartado después de esperar demasiado tiempo");
-              return;
-            }
+            if (isProcessingEvent) return;
           }
           
           try {
             isProcessingEvent = true;
-            console.log("Cambio detectado en events:", payload);
             
-            // Obtener eventos de forma segura
-            const events = await getEvents();
+            // Usar executeRPCWithFallback para obtener eventos con manejo de errores mejorado
+            const events = await executeRPCWithFallback<Event[], null>(
+              'get_events',
+              null,
+              async () => await getEvents(),
+              'subscribeToEvents-payload'
+            );
+            
             if (isChannelActive) {
               // Usar try/catch específico para el callback
               try {
@@ -401,37 +403,48 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
               }
             }
           } catch (error) {
-            console.error("Error al procesar cambio en events:", error);
+            // El error ya se maneja en executeRPCWithFallback
           } finally {
             isProcessingEvent = false;
           }
         },
       )
       .subscribe(async (status, error) => {
-        console.log(`Estado de suscripción (${channelId}):`, status)
-
         if (status === 'SUBSCRIBED') {
           // Resetear contador de intentos cuando se conecta exitosamente
           reconnectAttempts = 0;
-          console.log('Suscripción establecida correctamente, actualizando datos...');
+          lastErrorMessage = "";
+          
           try {
-            const events = await getEvents();
-            callback(events);
+            // Usar executeRPCWithFallback para obtener eventos con manejo de errores mejorado
+            const events = await executeRPCWithFallback<Event[], null>(
+              'get_events',
+              null,
+              async () => await getEvents(),
+              'subscribeToEvents-initial'
+            );
+            
+            if (isChannelActive) {
+              callback(events);
+            }
           } catch (dataError) {
-            console.error('Error al obtener datos después de suscripción:', dataError);
+            // El error ya se maneja en executeRPCWithFallback
           }
         } else if (status === 'CHANNEL_ERROR') {
-          console.error(`Error en la suscripción (${channelId}):`, error);
+          // Evitar registrar el mismo error repetidamente
+          const errorMessage = error ? (error instanceof Error ? error.message : String(error)) : "Error desconocido";
+          if (errorMessage !== lastErrorMessage) {
+            console.error(`Error en la suscripción (${channelId}):`, error);
+            lastErrorMessage = errorMessage;
+          }
           
           // Implementar backoff exponencial con jitter para evitar reconexiones simultáneas
           if (isChannelActive && reconnectAttempts < maxReconnectAttempts) {
             reconnectAttempts++;
             // Calcular tiempo de espera con backoff exponencial y jitter
-            const baseDelay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 30000); // Máximo 30 segundos
+            const baseDelay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 20000); // Máximo 20 segundos
             const jitter = Math.floor(Math.random() * 1000); // Añadir hasta 1 segundo de jitter
             const backoffTime = baseDelay + jitter;
-            
-            console.log(`Intento de reconexión ${reconnectAttempts}/${maxReconnectAttempts} en ${backoffTime}ms...`);
             
             // Esperar antes de intentar reconectar
             await new Promise(resolve => setTimeout(resolve, backoffTime));
@@ -440,38 +453,51 @@ export async function subscribeToEvents(callback: (events: Event[]) => void): Pr
               try {
                 // Intentar reconectar el canal
                 await channel.subscribe();
-                console.log('Reconexión exitosa');
               } catch (reconnectError) {
-                console.error('Error al reconectar:', reconnectError);
-                // Continuar con el sistema de reintentos automáticos
+                // Error ya manejado por el sistema de reintentos automáticos
               }
             }
           } else if (reconnectAttempts >= maxReconnectAttempts) {
-            console.log(`Se alcanzó el máximo de intentos de reconexión (${maxReconnectAttempts}). Deteniendo reintentos.`);
+            // Si se alcanzó el máximo de intentos, crear un nuevo canal
             isChannelActive = false;
+            
+            // Esperar un poco antes de intentar crear un nuevo canal
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Intentar crear una nueva suscripción recursivamente
+            if (typeof window !== "undefined") {
+              try {
+                const newUnsubscribe = await subscribeToEvents(callback);
+                return newUnsubscribe;
+              } catch (renewError) {
+                console.error("Error al renovar suscripción:", renewError);
+              }
+            }
           }
         } else if (error) {
-          console.error(`Error inesperado en la suscripción (${channelId}):`, error);
+          // Evitar registrar el mismo error repetidamente
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage !== lastErrorMessage) {
+            console.error(`Error inesperado en la suscripción (${channelId}):`, error);
+            lastErrorMessage = errorMessage;
+          }
         }
       })
 
     // Devolver función para cancelar la suscripción
     return () => {
-      console.log(`Cancelando suscripción al canal ${channelId}`)
       isChannelActive = false;
       try {
         supabase.removeChannel(channel)
       } catch (cleanupError) {
-        console.error("Error al limpiar canal:", cleanupError)
-        // Continuar incluso si hay error al limpiar
+        // Error ya manejado internamente
       }
     }
   } catch (error) {
     console.error("Error al crear suscripción a events:", error)
-    // Retornar una función vacía en caso de error
-    return () => {
-      console.log("Limpieza de suscripción fallida")
-    }
+    
+    // Implementar reintentos para la creación inicial de la suscripción
+    return () => {}
   }
 }
 
